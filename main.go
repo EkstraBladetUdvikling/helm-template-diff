@@ -15,7 +15,9 @@ import (
 func main() {
 	var path string
 	var env string
+	var values []string
 	var target string
+	var dryRun string
 
 	cmd := &cli.Command{
 		Name:  "helm-template-diff",
@@ -23,23 +25,62 @@ func main() {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:        "path",
-				Value:       "./helm",
 				Usage:       "Path to helm chart directory",
 				Destination: &path,
-				Required:    true,
+				Required:    false,
+				Validator: func(s string) error {
+					entries, err := os.ReadDir(s)
+					if err != nil {
+						return err
+					}
+
+					hasChart := false
+					for _, e := range entries {
+						if e.Name() == "Chart.yaml" {
+							hasChart = true
+							break
+						}
+					}
+
+					if !hasChart {
+						return fmt.Errorf("Invalid path - directory does not contain a helm chart")
+					}
+
+					return nil
+				},
 			},
 			&cli.StringFlag{
 				Name:        "env",
-				Value:       "test",
-				Usage:       "K8s context (test|production)",
+				Usage:       "K8s context (test|production) - maps to values.yaml & `ENV`-values.yaml",
 				Destination: &env,
-				Required:    true,
+				Required:    false,
+				Validator: func(s string) error {
+					if s != "test" && s != "production" {
+						return fmt.Errorf("ENV value must be one of test|production")
+					}
+
+					return nil
+				},
+			},
+			&cli.StringSliceFlag{
+				Name:        "values",
+				Value:       []string{"values.yaml", "test-values.yaml"},
+				Usage:       "If env is not set, uses these explicit values instead",
+				Destination: &values,
+				Required:    false,
 			},
 			&cli.StringFlag{
 				Name:        "target",
 				Value:       "main/master",
 				Usage:       "Target branch to compare helm templates with",
 				Destination: &target,
+				Required:    false,
+			},
+			&cli.StringFlag{
+				Name:        "dry-run",
+				Value:       "server",
+				Usage:       "Helm template --dry-run argument",
+				Destination: &dryRun,
 				Required:    false,
 			},
 		},
@@ -60,47 +101,10 @@ func main() {
 				return err
 			}
 
-			/*
-				files, err := getDiffedFiles(target, path)
-				if err != nil {
-					return err
-				}
-
-				uniqueCharts, err := getUniqueCharts(files)
-				if err != nil {
-					return err
-				}
-				fmt.Println(uniqueCharts)
-			*/
-
-			currTemplate, err := template(path, env)
-			if err != nil {
-				return err
-			}
-
-			currBranch, err := getCurrentBranch(path)
-			if err != nil {
-				fmt.Printf("Failed to get current branch %s\n", path)
-				return err
-			}
-
-			if err := checkoutBranch(target, path); err != nil {
-				fmt.Printf("Failed to checkout target branch %s, %s\n", target, path)
-				return err
-			}
-			headTemplate, err := template(path, env)
-			if err != nil {
-				fmt.Printf("Failed to get target template %s\n", path)
-				return err
-			}
-			if err := checkoutBranch(currBranch, path); err != nil {
-				fmt.Printf("Failed to checkout current branch %s, %s\n", currBranch, path)
-				return err
-			}
-
-			if err := OutputDiffTemplates(headTemplate, currTemplate); err != nil {
-				fmt.Printf("Failed to diff files\n")
-				return err
+			if path != "" {
+				CompareExplicitPath(path, target, env, dryRun)
+			} else {
+				CompareGitCharts(path, target)
 			}
 
 			return nil
@@ -110,6 +114,85 @@ func main() {
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func CompareGitCharts(target string, path string) error {
+	toplevel, err := getTopLevel()
+	if err != nil {
+		return err
+	}
+
+	files, err := getDiffedFiles(target, toplevel)
+	if err != nil {
+		return err
+	}
+
+	uniqueCharts, err := getUniqueCharts(files)
+	if err != nil {
+		return err
+	}
+	fmt.Println(uniqueCharts)
+
+	return nil
+}
+
+func getTopLevel() (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	stdout, err := cmd.StdoutPipe()
+	cmd.Stderr = os.Stderr
+	if err != nil {
+		fmt.Printf("Failed to pipe git rev-parse stdout\n")
+		return "", err
+	}
+	if err := cmd.Start(); err != nil {
+		fmt.Printf("Failed to exec git rev-parse\n")
+		return "", err
+	}
+	str, err := io.ReadAll(stdout)
+	if err != nil {
+		fmt.Printf("Failed to read git rev-parse stdout\n")
+		return "", err
+	}
+	if err := cmd.Wait(); err != nil {
+		fmt.Printf("Failed to exec git rev-parse\n")
+		return "", err
+	}
+
+	return string(str), nil
+}
+
+func CompareExplicitPath(path string, target string, env string, dryRun string) error {
+	currTemplate, err := template(path, env, dryRun)
+	if err != nil {
+		return err
+	}
+
+	currBranch, err := getCurrentBranch(path)
+	if err != nil {
+		fmt.Printf("Failed to get current branch %s\n", path)
+		return err
+	}
+
+	if err := checkoutBranch(target, path); err != nil {
+		fmt.Printf("Failed to checkout target branch %s, %s\n", target, path)
+		return err
+	}
+	headTemplate, err := template(path, env, dryRun)
+	if err != nil {
+		fmt.Printf("Failed to get target template %s\n", path)
+		return err
+	}
+	if err := checkoutBranch(currBranch, path); err != nil {
+		fmt.Printf("Failed to checkout current branch %s, %s\n", currBranch, path)
+		return err
+	}
+
+	if err := OutputDiffTemplates(headTemplate, currTemplate); err != nil {
+		fmt.Printf("Failed to diff files\n")
+		return err
+	}
+
+	return nil
 }
 
 func OutputDiffTemplates(target string, current string) error {
@@ -171,16 +254,20 @@ func getHeadBranch(path string) (string, error) {
 	stdout, err := cmd.StdoutPipe()
 	cmd.Stderr = os.Stderr
 	if err != nil {
+		fmt.Printf("Failed to pipe git symbolic-ref stdout\n")
 		return "", err
 	}
 	if err := cmd.Start(); err != nil {
+		fmt.Printf("Failed to exec git rev-parse\n")
 		return "", err
 	}
 	str, err := io.ReadAll(stdout)
 	if err != nil {
+		fmt.Printf("Failed to read git rev-parse stdout\n")
 		return "", err
 	}
 	if err := cmd.Wait(); err != nil {
+		fmt.Printf("Failed to exec git rev-parse\n")
 		return "", err
 	}
 
@@ -238,18 +325,22 @@ func getDiffedFiles(head string, path string) ([]string, error) {
 	stdout, err := cmd.StdoutPipe()
 	cmd.Stderr = os.Stderr
 	if err != nil {
+		fmt.Printf("Failed to pipe git diff stdout\n")
 		return []string{}, err
 	}
 	if err := cmd.Start(); err != nil {
+		fmt.Printf("Failed to exec git diff\n")
 		return []string{}, err
 	}
 
 	namesStr, err := io.ReadAll(stdout)
 	if err != nil {
+		fmt.Printf("Failed to read git diff pipe\n")
 		return []string{}, err
 	}
 
 	if err := cmd.Wait(); err != nil {
+		fmt.Printf("Failed to exec git diff\n")
 		return []string{}, err
 	}
 
@@ -266,12 +357,12 @@ func getUniqueCharts(files []string) ([]string, error) {
 	return files, nil
 }
 
-func template(path string, env string) (string, error) {
+func template(path string, env string, dryRun string) (string, error) {
 	args := []string{"template",
 		path,
 		fmt.Sprintf("-f=%s/values.yaml", path),
 		fmt.Sprintf("-f=%s/%s-values.yaml", path, env),
-		"--dry-run=server"}
+		fmt.Sprintf("--dry-run=%s", dryRun)}
 	cmd := exec.Command("helm", args...)
 	stdout, err := cmd.StdoutPipe()
 	cmd.Stderr = os.Stderr
