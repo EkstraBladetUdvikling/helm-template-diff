@@ -116,7 +116,7 @@ func main() {
 	}
 }
 
-func CompareGitCharts(target string, path string) error {
+func CompareGitCharts(path string, target string) error {
 	toplevel, err := getTopLevel()
 	if err != nil {
 		return err
