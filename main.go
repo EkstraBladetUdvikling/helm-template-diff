@@ -329,7 +329,7 @@ func getDiffedFiles(head string, path string) ([]string, error) {
 		return []string{}, err
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("Failed to exec git diff\n")
+		fmt.Printf("Failed to exec git diff\n %s", err)
 		return []string{}, err
 	}
 
