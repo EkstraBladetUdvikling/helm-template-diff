@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/urfave/cli/v3"
@@ -81,10 +82,23 @@ func main() {
 				return err
 			}
 
-			if path != "" {
-				CompareExplicitPath(path, target, env, dryRun)
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return err
+			}
+
+			hasChart := false
+			for _, e := range entries {
+				if e.Name() == "Chart.yaml" {
+					hasChart = true
+					break
+				}
+			}
+
+			if !hasChart {
+				CompareGitCharts(path, target, env, dryRun)
 			} else {
-				CompareGitCharts(path, target)
+				CompareExplicitPath(path, target, env, dryRun)
 			}
 
 			return nil
@@ -96,8 +110,8 @@ func main() {
 	}
 }
 
-func CompareGitCharts(path string, target string) error {
-	toplevel, err := getTopLevel()
+func CompareGitCharts(path string, target string, env string, dryRun string) error {
+	toplevel, err := getTopLevel(path)
 	if err != nil {
 		return err
 	}
@@ -107,17 +121,61 @@ func CompareGitCharts(path string, target string) error {
 		return err
 	}
 
-	uniqueCharts, err := getUniqueCharts(files)
+	uniqueCharts, err := getUniqueCharts(files, toplevel)
 	if err != nil {
 		return err
 	}
-	fmt.Println(uniqueCharts)
+
+	currTemplates := map[string]string{}
+	for i := range uniqueCharts {
+		temp, err := template(uniqueCharts[i], env, dryRun)
+		if err != nil {
+			return err
+		}
+
+		currTemplates[uniqueCharts[i]] = temp
+	}
+
+	currBranch, err := getCurrentBranch(path)
+	if err != nil {
+		fmt.Printf("Failed to get current branch %s\n", path)
+		return err
+	}
+
+	if err := checkoutBranch(target, path); err != nil {
+		fmt.Printf("Failed to checkout target branch %s, %s\n", target, path)
+		return err
+	}
+
+	headTemplates := map[string]string{}
+	for i := range uniqueCharts {
+		temp, err := template(uniqueCharts[i], env, dryRun)
+		if err != nil {
+			fmt.Printf("Failed to get target template %s\n", path)
+			return err
+		}
+
+		headTemplates[uniqueCharts[i]] = temp
+	}
+
+	if err := checkoutBranch(currBranch, path); err != nil {
+		fmt.Printf("Failed to checkout current branch %s, %s\n", currBranch, path)
+		return err
+	}
+
+	for key := range currTemplates {
+		if err := OutputDiffTemplates(key, headTemplates[key], currTemplates[key], dryRun); err != nil {
+			fmt.Printf("Failed to diff files\n")
+			return err
+		}
+	}
 
 	return nil
 }
 
-func getTopLevel() (string, error) {
+func getTopLevel(path string) (string, error) {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = path
 	stdout, err := cmd.StdoutPipe()
 	cmd.Stderr = os.Stderr
 	if err != nil {
@@ -138,7 +196,7 @@ func getTopLevel() (string, error) {
 		return "", err
 	}
 
-	return string(str), nil
+	return strings.Trim(string(str), "\n"), nil
 }
 
 func CompareExplicitPath(path string, target string, env string, dryRun string) error {
@@ -167,7 +225,7 @@ func CompareExplicitPath(path string, target string, env string, dryRun string) 
 		return err
 	}
 
-	if err := OutputDiffTemplates(headTemplate, currTemplate); err != nil {
+	if err := OutputDiffTemplates(path, headTemplate, currTemplate, dryRun); err != nil {
 		fmt.Printf("Failed to diff files\n")
 		return err
 	}
@@ -175,7 +233,7 @@ func CompareExplicitPath(path string, target string, env string, dryRun string) 
 	return nil
 }
 
-func OutputDiffTemplates(target string, current string) error {
+func OutputDiffTemplates(path string, target string, current string, dryRun string) error {
 	targetTxt := "target.txt"
 	currentTxt := "current.txt"
 	if err := os.WriteFile(targetTxt, []byte(target), 0644); err != nil {
@@ -187,7 +245,8 @@ func OutputDiffTemplates(target string, current string) error {
 		return err
 	}
 
-	fmt.Println("-------------------------- Server helm template diff --------------------------")
+	fmt.Printf("\n-------------------------- %s helm template diff --------------------------\n", dryRun)
+	fmt.Printf("\x1b[%dmSTART\x1b[0m %s\n", 34, path)
 
 	cmd := exec.Command("diff", "--color=always", "-u", targetTxt, currentTxt)
 	cmd.Stdout = os.Stdout
@@ -202,6 +261,8 @@ func OutputDiffTemplates(target string, current string) error {
 		fmt.Println(err)
 		return err
 	}
+
+	fmt.Printf("\x1b[%dmEND\x1b[0m %s\n\n", 34, path)
 
 	return nil
 }
@@ -300,7 +361,6 @@ func isStatusClean(path string) (bool, error) {
 }
 
 func getDiffedFiles(head string, path string) ([]string, error) {
-	fmt.Printf("")
 	cmd := exec.Command("git", "diff", head, "--name-only")
 	cmd.Dir = path
 	stdout, err := cmd.StdoutPipe()
@@ -321,7 +381,7 @@ func getDiffedFiles(head string, path string) ([]string, error) {
 	}
 
 	if err := cmd.Wait(); err != nil {
-		fmt.Printf("Failed to exec git diff\n")
+		fmt.Printf("Error on git diff\n")
 		return []string{}, err
 	}
 
@@ -331,11 +391,51 @@ func getDiffedFiles(head string, path string) ([]string, error) {
 }
 
 // TODO - diff all modified templates, check which Charts the diffed files belong to. Diff each Chart.yaml in that target and current branch
-func getUniqueCharts(files []string) ([]string, error) {
-	for i := 0; i < len(files); i++ {
-		fmt.Println(files[i])
+func getUniqueCharts(files []string, root string) ([]string, error) {
+	diffedFileChartDirs := map[string]string{}
+	for i := range files {
+		re := regexp.MustCompile(`.*/`)
+		fileDir := strings.TrimRight(string(re.Find([]byte(files[i]))), "/")
+		dir, err := getChartRecursive(fmt.Sprintf("%s/%s", root, fileDir), root)
+		if err == nil {
+			diffedFileChartDirs[dir] = dir
+		}
 	}
-	return files, nil
+
+	keys := make([]string, 0, len(diffedFileChartDirs))
+	for k := range diffedFileChartDirs {
+		keys = append(keys, k)
+	}
+
+	return keys, nil
+}
+
+func getChartRecursive(dir string, limit string) (string, error) {
+	if dir == limit {
+		return "", fmt.Errorf("Path reached limit before finding Chart.yaml file. dir=%s, limit=%s", dir, limit)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	hasChart := false
+	chartDir := dir
+	for _, e := range entries {
+		if e.Name() == "Chart.yaml" {
+			hasChart = true
+			break
+		}
+	}
+
+	if !hasChart {
+		re := regexp.MustCompile(`.*/`)
+		prevDir := strings.TrimRight(string(re.Find([]byte(chartDir))), "/")
+		return getChartRecursive(prevDir, limit)
+	}
+
+	return chartDir, nil
 }
 
 func template(path string, env string, dryRun string) (string, error) {
