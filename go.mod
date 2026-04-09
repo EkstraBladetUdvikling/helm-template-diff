@@ -1,4 +1,4 @@
-module helm-template-diff
+module github.com/EkstraBladetUdvikling/helm-template-diff
 
 go 1.26.1
 
