@@ -25,29 +25,9 @@ func main() {
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:        "path",
-				Usage:       "Path to helm chart directory",
+				Usage:       "Path to helm chart or repository. Direct reference to a helm chart will only diff that chart, otherwise helm-template-diff will try to find all diffed charts in the path's repository",
 				Destination: &path,
 				Required:    false,
-				Validator: func(s string) error {
-					entries, err := os.ReadDir(s)
-					if err != nil {
-						return err
-					}
-
-					hasChart := false
-					for _, e := range entries {
-						if e.Name() == "Chart.yaml" {
-							hasChart = true
-							break
-						}
-					}
-
-					if !hasChart {
-						return fmt.Errorf("Invalid path - directory does not contain a helm chart")
-					}
-
-					return nil
-				},
 			},
 			&cli.StringFlag{
 				Name:        "env",
@@ -320,6 +300,7 @@ func isStatusClean(path string) (bool, error) {
 }
 
 func getDiffedFiles(head string, path string) ([]string, error) {
+	fmt.Printf("")
 	cmd := exec.Command("git", "diff", head, "--name-only")
 	cmd.Dir = path
 	stdout, err := cmd.StdoutPipe()
