@@ -82,8 +82,17 @@ func main() {
 				return err
 			}
 
+			if path == "" {
+				toplevel, err := getTopLevel(path)
+				if err != nil {
+					return err
+				}
+				path = toplevel
+			}
+
 			entries, err := os.ReadDir(path)
 			if err != nil {
+				fmt.Printf("Could not read dir %s.", path)
 				return err
 			}
 
@@ -111,17 +120,12 @@ func main() {
 }
 
 func CompareGitCharts(path string, target string, env string, dryRun string) error {
-	toplevel, err := getTopLevel(path)
+	files, err := getDiffedFiles(target, path)
 	if err != nil {
 		return err
 	}
 
-	files, err := getDiffedFiles(target, toplevel)
-	if err != nil {
-		return err
-	}
-
-	uniqueCharts, err := getUniqueCharts(files, toplevel)
+	uniqueCharts, err := getUniqueCharts(files, path)
 	if err != nil {
 		return err
 	}
